@@ -1,5 +1,6 @@
 # Assignment 4: NanoGPT149
-
+PYTORCH: 2.0.1
+PYTHON: 3.10.13
 **Due Monday Dec 4, 11:59pm PST**
 
 **100 points total + 12 Points EC**
