@@ -392,8 +392,102 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     std::vector<float> li = formatTensor(LiTensor);
     std::vector<float> lij = formatTensor(LijTensor);
     std::vector<float> lnew = formatTensor(LnewTensor);
-
     // -------- YOUR CODE HERE  -------- //
+    int Tr = (N + Br - 1) / Br;
+    int Tc = (N + Bc - 1) / Bc;
+    for (int b = 0 ; b < B; b++) {
+        for (int h = 0 ; h < H; h++) {
+            std::fill(l.begin(), l.end(), 0.0f); // This is quite important!!!
+            for (int j = 0 ; j < Tc; j++) {
+                // Load K_j, V_j into local memory blocks
+                for (int ii = 0 ; ii < std::min(Bc, N - j * Bc); ii++) {
+                    for (int jj = 0; jj < d; jj++) {
+                        int ii_abs = j * Bc + ii;
+                        float kiijj_val = fourDimRead(K, b, h, ii_abs, jj, H, N, d);
+                        float viijj_val = fourDimRead(V, b, h, ii_abs, jj, H, N, d);
+                        twoDimWrite(Kj, ii, jj, d, kiijj_val);
+                        twoDimWrite(Vj, ii, jj, d, viijj_val);
+                    }
+                }
+                for (int i = 0 ; i < Tr ; i++) {
+                    // Load Qi, Oi, li into local memory blocks
+                    for (int ii = 0 ; ii < std::min(Br, N - i * Br); ii++) {
+                        int ii_abs = i * Br +ii;
+                        for (int jj = 0; jj < d; jj++) {
+                            float qiijj_val = fourDimRead(Q, b, h, ii_abs, jj, H, N, d);
+                            float oiijj_val = fourDimRead(O, b, h, ii_abs, jj, H, N, d);
+                            twoDimWrite(Qi, ii, jj, d, qiijj_val);
+                            twoDimWrite(Oi, ii, jj, d, oiijj_val);
+                        }
+                        li[ii] = l[ii_abs];
+                    }
+                    // Compute Sij=QiKj^T of size(Br x Bc) via matrix multiply
+                    for (int r = 0 ; r < std::min(Br, N - i * Br); r++) {
+                        for (int c = 0 ; c < std::min(Bc, N - j * Bc); c++) {
+                            float sum = 0;
+                            for (int k = 0 ; k < d; k++){
+                                float q_rk = twoDimRead(Qi, r, k, d);
+                                float k_ck = twoDimRead(Kj, c, k, d);
+                                sum += q_rk * k_ck;
+                            }
+                            twoDimWrite(Sij, r, c, Bc, sum);
+                        }
+                    }
+                    // Pij <- exp(Sij) of size (Br x Bc)
+                    for (int r = 0 ; r < std::min(Br, N - i * Br); r++) {
+                        for (int c = 0 ; c < std::min(Bc, N - j * Bc); c++) {
+                            float val = twoDimRead(Sij, r, c, Bc);
+                            val = std::exp(val);
+                            twoDimWrite(Pij, r, c, Bc, val);
+                        }
+                    }
+                    // lij <- rowsum(Pij) of size Br
+                    for (int r = 0 ; r < std::min(Br, N - i * Br); r++) {
+                        float sum = 0;
+                        for (int c = 0 ; c < std::min(Bc, N - j * Bc); c++) {
+                            float val = twoDimRead(Pij, r, c, Bc);
+                            sum += val;
+                        }
+                        lij[r] = sum;
+                    }
+                    // lnew <- li + lij
+                    for (int r = 0 ; r < std::min(Br, N - i * Br); r++) {
+                        lnew[r] = li[r] + lij[r];
+                    }
+
+
+                    // calculate PV
+                    for (int r = 0; r < std::min(Br, N - i * Br); r++) {
+                        for (int c = 0 ; c < d; c++) {
+                            float val = 0;
+                            for (int k = 0 ; k < std::min(Bc, N - j * Bc); k++) {
+                                val += twoDimRead(Pij, r, k, Bc) * twoDimRead(Vj, k, c, d);
+                            }
+                            twoDimWrite(PV, r, c, d, val);
+                        }
+                    }
+                    // Oi <- (liOi + PijVj)/lnew
+                    for (int r = 0 ; r < std::min(Br, N - i * Br); r++) {
+                        for (int c = 0 ; c < d; c++) {
+                            float pv_val = twoDimRead(PV, r, c, d);
+                            float o_val = twoDimRead(Oi, r, c, d);
+                            o_val = (li[r] * o_val +pv_val) / lnew[r];
+                            twoDimWrite(Oi, r, c, d, o_val);
+                        }
+                    }
+                    // Write blocks Oi and lnew back to O and l in main memory
+                    for (int ii = 0 ; ii < std::min(Br, N - i * Br); ii++) {
+                        int ii_abs = i * Br + ii;
+                        for (int jj = 0; jj < d; jj++) {
+                            float oiijj_val = twoDimRead(Oi, ii, jj, d);
+                            fourDimWrite(O, b, h, ii_abs, jj, H, N, d, oiijj_val);
+                        }
+                        l[ii_abs] = lnew[ii];
+                    }
+                }
+            }
+        }
+    }
 
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
