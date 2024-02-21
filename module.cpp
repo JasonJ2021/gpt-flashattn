@@ -5,6 +5,7 @@
 #include <sys/time.h>
 #include <vector>
 #include <immintrin.h>
+#include <cstdio>
 
 // Uncomment for ISPC
 //#include "module_ispc.h"
@@ -177,6 +178,16 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
 // ---------------------------------------------------------- //
 //     PART 2: BLOCKED MATRIX MULTIPLY AND UNFUSED SOFTMAX    //
 // ---------------------------------------------------------- //
+size_t cache_line_size(){
+    std::FILE *p;
+    p = fopen("/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size", "r");
+    unsigned int i = 0;
+    if (p) {
+        fscanf(p, "%d", &i);
+        fclose(p);
+    }
+    return i;
+}
 
 torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTensor, torch::Tensor VTensor, torch::Tensor QK_tTensor,
                 int B, int H, int N, int d){
@@ -197,7 +208,69 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
     std::vector<float> QK_t = formatTensor(QK_tTensor);
 
     // -------- YOUR CODE HERE  -------- //
-
+    size_t cacheLineSize = cache_line_size();
+    int blockSize = cacheLineSize / sizeof(float);
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            std::fill(QK_t.begin(), QK_t.end(), 0.0f);
+            // 1. calculate QK^T
+            for (int i = 0; i < (N + blockSize - 1)/ blockSize; i++) {
+                for (int j = 0; j < (N + blockSize - 1) / blockSize; j++) {
+                    for (int k = 0; k < (d + blockSize - 1) / blockSize; k++) {
+                        for (int ii = i * blockSize; ii < std::min((i + 1) * blockSize, N); ii++) {
+                            for (int jj = j * blockSize; jj < std::min((j + 1) * blockSize, N); jj++) {
+                                float sum = twoDimRead(QK_t, ii, jj, N);
+                                for (int kk = k * blockSize; kk < std::min((k + 1) * blockSize, d); kk++) {
+                                    float q_ik = fourDimRead(Q, b, h, ii, kk, H, N, d);
+                                    float k_jk = fourDimRead(K, b, h, jj, kk, H, N, d);
+                                    sum += q_ik * k_jk;
+                                }
+                                twoDimWrite(QK_t, ii, jj, N, sum);
+                            }
+                        }
+                    }
+                }
+            }
+            // 2. apply softmax to each row of QK^T
+            for (int i = 0 ; i < N; i++)  {
+                float sum = 0;
+                for (int j = 0 ; j < N ; j++) {
+                    float QKt_ij = twoDimRead(QK_t, i, j, N);
+                    QKt_ij = std::exp(QKt_ij);
+                    twoDimWrite(QK_t, i, j, N, QKt_ij);
+                    sum += QKt_ij;
+                }
+                for (int j = 0 ; j < N ; j++) {
+                    float QKt_ij = twoDimRead(QK_t, i, j, N);
+                    QKt_ij /= sum;
+                    twoDimWrite(QK_t, i, j, N, QKt_ij);
+                }
+            }
+            // 3. multiply QK^T(N x N) with V(N x d)
+            for (int i = 0; i < (N + blockSize - 1)/ blockSize; i++) {
+                for (int j = 0; j < (d + blockSize - 1) / blockSize; j++) {
+                    for (int k = 0; k < (N + blockSize - 1) / blockSize; k++) {
+                        for (int ii = i * blockSize; ii < std::min((i + 1) * blockSize, N); ii++) {
+                            for (int jj = j * blockSize; jj < std::min((j + 1) * blockSize, d); jj++) {
+                                if (k == 0){
+                                    float zero = 0;
+                                    fourDimWrite(O, b, h, ii, jj, H, N, d, zero);
+                                }
+                                float sum = fourDimRead(O, b, h, ii, jj, H, N, d);
+                                for (int kk = k * blockSize; kk < std::min((k + 1) * blockSize, N); kk++) {
+                                    float qkt_ik = twoDimRead(QK_t, ii, kk, N); 
+                                    float v_kj = fourDimRead(V, b, h, kk, jj, H, N, d);
+                                    sum += qkt_ik * v_kj;
+                                }
+                                fourDimWrite(O, b, h, ii, jj, H, N, d, sum);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
     return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
